@@ -112,7 +112,7 @@ ingresses:
   - name: domain
     className: "nginx"
     hosts:
-      - retail-store.trainwithshubham.com
+      - tastydrive.store
     annotations:
       nginx.ingress.kubernetes.io/ssl-redirect: "true"
       nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
@@ -122,9 +122,9 @@ ingresses:
       nginx.ingress.kubernetes.io/proxy-send-timeout: "600"
       nginx.ingress.kubernetes.io/proxy-read-timeout: "600"
     tls:
-      - secretName: tls-secret
+      - secretName: tastydrive-store-tls
         hosts:
-          - retail-store.trainwithshubham.com
+          - tastydrive.store
 
 # Cert Manager Configuration
 certManager:
