@@ -1,0 +1,127 @@
+name: Validate CI/CD Workflow
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/ci-cd.yml'
+      - '.github/ecr-lifecycle-policy.json'
+      - '.github/scripts/**'
+  workflow_dispatch:
+
+jobs:
+  validate-workflow:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+
+      - name: Make validation script executable
+        run: chmod +x .github/scripts/validate-workflow.sh
+
+      - name: Run workflow validation
+        run: .github/scripts/validate-workflow.sh
+
+      - name: Validate workflow syntax with actionlint
+        uses: raven-actions/actionlint@v1
+        with:
+          files: '.github/workflows/ci-cd.yml'
+
+  test-change-detection:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Test change detection logic
+        run: |
+          echo "Testing change detection scenarios..."
+          
+          # Test 1: Single service change
+          echo "Test 1: Single service change (ui)"
+          mkdir -p test-changes/src/ui
+          echo "test" > test-changes/src/ui/test.txt
+          git add test-changes/
+          git commit -m "Test: UI service change"
+          
+          # Simulate the change detection logic
+          changed_files=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files: $changed_files"
+          
+          services=()
+          for service in ui catalog cart checkout orders; do
+            if echo "$changed_files" | grep -q "^test-changes/src/$service/"; then
+              services+=("$service")
+            fi
+          done
+          
+          if [[ "${services[*]}" == "ui" ]]; then
+            echo "✅ Single service detection works"
+          else
+            echo "❌ Single service detection failed: ${services[*]}"
+            exit 1
+          fi
+          
+          # Test 2: Multiple service changes
+          echo "Test 2: Multiple service changes (catalog, cart)"
+          mkdir -p test-changes/src/catalog test-changes/src/cart
+          echo "test" > test-changes/src/catalog/test.txt
+          echo "test" > test-changes/src/cart/test.txt
+          git add test-changes/
+          git commit -m "Test: Multiple service changes"
+          
+          changed_files=$(git diff --name-only HEAD~1 HEAD)
+          echo "Changed files: $changed_files"
+          
+          services=()
+          for service in ui catalog cart checkout orders; do
+            if echo "$changed_files" | grep -q "^test-changes/src/$service/"; then
+              services+=("$service")
+            fi
+          done
+          
+          if [[ "${#services[@]}" -eq 2 ]] && [[ " ${services[*]} " =~ " catalog " ]] && [[ " ${services[*]} " =~ " cart " ]]; then
+            echo "✅ Multiple service detection works"
+          else
+            echo "❌ Multiple service detection failed: ${services[*]}"
+            exit 1
+          fi
+          
+          # Cleanup
+          git reset --hard HEAD~2
+          rm -rf test-changes/
+
+  test-matrix-generation:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Test matrix generation
+        run: |
+          echo "Testing matrix generation..."
+          
+          # Test valid services
+          services=("ui" "catalog" "cart")
+          services_json=$(printf '%s\n' "${services[@]}" | jq -R . | jq -s .)
+          echo "Generated matrix: $services_json"
+          
+          # Validate JSON
+          if echo "$services_json" | jq empty 2>/dev/null; then
+            echo "✅ Matrix JSON is valid"
+          else
+            echo "❌ Matrix JSON is invalid"
+            exit 1
+          fi
+          
+          # Test parsing back
+          parsed_services=($(echo "$services_json" | jq -r '.[]'))
+          if [[ "${#parsed_services[@]}" -eq 3 ]]; then
+            echo "✅ Matrix parsing works"
+          else
+            echo "❌ Matrix parsing failed"
+            exit 1
+          fi

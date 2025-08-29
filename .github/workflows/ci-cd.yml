@@ -1,0 +1,821 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [gitops]
+    paths:
+      - "src/ui/**"
+      - "src/catalog/**"
+      - "src/cart/**"
+      - "src/checkout/**"
+      - "src/orders/**"
+  pull_request:
+    branches: [gitops]
+    paths:
+      - "src/ui/**"
+      - "src/catalog/**"
+      - "src/cart/**"
+      - "src/checkout/**"
+      - "src/orders/**"
+  workflow_dispatch:
+    inputs:
+      services:
+        description: 'Services to build (comma-separated: ui,catalog,cart,checkout,orders or "all")'
+        required: false
+        default: "all"
+        type: string
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REGISTRY: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com
+  COMMIT_SHA: ${{ github.sha }}
+  SHORT_SHA: ${{ github.sha }}
+
+jobs:
+  # Placeholder for change detection job
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      services: ${{ steps.changes.outputs.services }}
+      has-changes: ${{ steps.changes.outputs.has-changes }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Detect changed services
+        id: changes
+        run: |
+          set -euo pipefail  # Exit on error, undefined vars, pipe failures
+
+          services=()
+
+          # Handle manual dispatch
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            input_services="${{ github.event.inputs.services }}"
+            if [[ "$input_services" == "all" || -z "$input_services" ]]; then
+              services=("ui" "catalog" "cart" "checkout" "orders")
+            else
+              IFS=',' read -ra ADDR <<< "$input_services"
+              for service in "${ADDR[@]}"; do
+                service=$(echo "$service" | xargs)  # trim whitespace
+                if [[ "$service" =~ ^(ui|catalog|cart|checkout|orders)$ ]]; then
+                  services+=("$service")
+                fi
+              done
+            fi
+          else
+            # Detect changes using git diff for push/PR events
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              base_sha="${{ github.event.pull_request.base.sha }}"
+              head_sha="${{ github.event.pull_request.head.sha }}"
+            else
+              base_sha="${{ github.event.before }}"
+              head_sha="${{ github.sha }}"
+            fi
+            
+            # Get changed files with error handling
+            if ! changed_files=$(git diff --name-only "$base_sha" "$head_sha" 2>/dev/null); then
+              echo "⚠️ Warning: Could not get diff between $base_sha and $head_sha"
+              echo "Falling back to HEAD~1 comparison..."
+              if ! changed_files=$(git diff --name-only HEAD~1 HEAD 2>/dev/null); then
+                echo "❌ Error: Could not determine changed files"
+                echo "This might be the first commit or a shallow clone"
+                echo "Defaulting to build all services for safety"
+                services=("ui" "catalog" "cart" "checkout" "orders")
+                changed_files=""
+              fi
+            fi
+            
+            # Check each service for changes
+            for service in ui catalog cart checkout orders; do
+              if echo "$changed_files" | grep -q "^src/$service/"; then
+                services+=("$service")
+              fi
+            done
+          fi
+
+          # Output results
+          if [ ${#services[@]} -eq 0 ]; then
+            echo "services=[]" >> $GITHUB_OUTPUT
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+            echo "No services changed or selected"
+          else
+            services_json=$(printf '%s\n' "${services[@]}" | jq -R . | jq -s .)
+            echo "services=$services_json" >> $GITHUB_OUTPUT
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "Services to build: ${services[*]}"
+          fi
+
+  build-services:
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: needs.detect-changes.outputs.has-changes == 'true'
+    strategy:
+      matrix:
+        service: ${{ fromJson(needs.detect-changes.outputs.services) }}
+      fail-fast: false
+      max-parallel: 3 # Optimize resource usage
+    outputs:
+      image-uris: ${{ steps.collect-uris.outputs.uris }}
+    timeout-minutes: 30 # Prevent hanging builds
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+        with:
+          mask-password: "true"
+
+      - name: Validate AWS credentials and permissions
+        run: |
+          echo "Validating AWS credentials..."
+
+          # Get caller identity
+          caller_identity=$(aws sts get-caller-identity)
+          echo "✅ AWS credentials validated successfully"
+
+          # Extract account ID and validate
+          account_id=$(echo "$caller_identity" | jq -r '.Account')
+          expected_account="${{ secrets.AWS_ACCOUNT_ID }}"
+
+          if [[ "$account_id" != "$expected_account" ]]; then
+            echo "❌ Account ID mismatch!"
+            echo "Expected: $expected_account"
+            echo "Actual: $account_id"
+            exit 1
+          fi
+
+          echo "✅ Account ID validation successful: $account_id"
+
+          # Test ECR permissions
+          echo "Testing ECR permissions..."
+          if aws ecr describe-repositories --max-items 1 > /dev/null 2>&1; then
+            echo "✅ ECR read permissions validated"
+          else
+            echo "❌ ECR permissions validation failed"
+            exit 1
+          fi
+
+          # Mask sensitive information
+          echo "::add-mask::$account_id"
+
+      - name: Set service variables
+        id: vars
+        run: |
+          service="${{ matrix.service }}"
+          ecr_repo="retail-store-$service"
+          short_sha="${{ env.SHORT_SHA }}"
+
+          # Truncate SHA to 7 characters
+          short_sha=${short_sha:0:7}
+
+          echo "service=$service" >> $GITHUB_OUTPUT
+          echo "ecr-repo=$ecr_repo" >> $GITHUB_OUTPUT
+          echo "short-sha=$short_sha" >> $GITHUB_OUTPUT
+          echo "image-uri=${{ env.ECR_REGISTRY }}/$ecr_repo:$short_sha" >> $GITHUB_OUTPUT
+
+          echo "Building service: $service"
+          echo "ECR repository: $ecr_repo"
+          echo "Image tag: $short_sha"
+          echo "Full image URI: ${{ env.ECR_REGISTRY }}/$ecr_repo:$short_sha"
+
+      - name: Create ECR repository if needed
+        id: create-repo
+        run: |
+          set -euo pipefail
+
+          ecr_repo="${{ steps.vars.outputs.ecr-repo }}"
+
+          echo "Checking if ECR repository exists: $ecr_repo"
+
+          # Check if repository exists
+          if aws ecr describe-repositories --repository-names "$ecr_repo" --region "${{ env.AWS_REGION }}" > /dev/null 2>&1; then
+            echo "✅ ECR repository already exists: $ecr_repo"
+            echo "repo-created=false" >> $GITHUB_OUTPUT
+          else
+            echo "Creating ECR repository: $ecr_repo"
+            
+            # Create repository with security scanning enabled
+            if ! aws ecr create-repository \
+              --repository-name "$ecr_repo" \
+              --region "${{ env.AWS_REGION }}" \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256; then
+              
+              echo "❌ Failed to create ECR repository: $ecr_repo"
+              echo "Common issues:"
+              echo "1. Check AWS credentials and permissions"
+              echo "2. Verify repository name is valid"
+              echo "3. Check if repository limit is reached"
+              echo "4. Ensure region is correct: ${{ env.AWS_REGION }}"
+              exit 1
+            fi
+            
+            echo "✅ ECR repository created successfully: $ecr_repo"
+            echo "repo-created=true" >> $GITHUB_OUTPUT
+            
+            # Apply lifecycle policy
+            echo "Applying lifecycle policy to repository: $ecr_repo"
+            aws ecr put-lifecycle-policy \
+              --repository-name "$ecr_repo" \
+              --region "${{ env.AWS_REGION }}" \
+              --lifecycle-policy-text file://.github/ecr-lifecycle-policy.json
+            
+            echo "✅ Lifecycle policy applied successfully"
+          fi
+
+          # Get repository URI for verification
+          repo_uri=$(aws ecr describe-repositories \
+            --repository-names "$ecr_repo" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+
+          echo "Repository URI: $repo_uri"
+          echo "repo-uri=$repo_uri" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ matrix.service }}-${{ hashFiles(format('src/{0}/Dockerfile', matrix.service), format('src/{0}/**/pom.xml', matrix.service), format('src/{0}/**/package.json', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-${{ matrix.service }}-
+            ${{ runner.os }}-buildx-
+
+      - name: Cache Maven dependencies
+        if: matrix.service == 'ui' || matrix.service == 'cart' || matrix.service == 'orders'
+        uses: actions/cache@v3
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-maven-${{ matrix.service }}-${{ hashFiles(format('src/{0}/**/pom.xml', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-maven-${{ matrix.service }}-
+            ${{ runner.os }}-maven-
+
+      - name: Cache Go modules
+        if: matrix.service == 'catalog'
+        uses: actions/cache@v3
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ matrix.service }}-${{ hashFiles(format('src/{0}/**/go.sum', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-go-${{ matrix.service }}-
+            ${{ runner.os }}-go-
+
+      - name: Cache Node modules
+        if: matrix.service == 'checkout'
+        uses: actions/cache@v3
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-${{ matrix.service }}-${{ hashFiles(format('src/{0}/**/package-lock.json', matrix.service)) }}
+          restore-keys: |
+            ${{ runner.os }}-node-${{ matrix.service }}-
+            ${{ runner.os }}-node-
+
+      - name: Build Docker image
+        id: build
+        run: |
+          set -euo pipefail
+
+          service="${{ steps.vars.outputs.service }}"
+          image_uri="${{ steps.vars.outputs.image-uri }}"
+
+          echo "Building Docker image for service: $service"
+
+          # Validate service directory exists
+          if [[ ! -d "src/$service" ]]; then
+            echo "❌ Error: Service directory not found: src/$service"
+            exit 1
+          fi
+
+          # Validate Dockerfile exists
+          if [[ ! -f "src/$service/Dockerfile" ]]; then
+            echo "❌ Error: Dockerfile not found: src/$service/Dockerfile"
+            exit 1
+          fi
+
+          # Build the Docker image with caching and error handling
+          if ! docker buildx build \
+            --platform linux/amd64 \
+            --cache-from type=local,src=/tmp/.buildx-cache \
+            --cache-to type=local,dest=/tmp/.buildx-cache-new,mode=max \
+            --tag "$image_uri" \
+            --tag "${{ env.ECR_REGISTRY }}/${{ steps.vars.outputs.ecr-repo }}:latest" \
+            --load \
+            src/$service/; then
+            
+            echo "❌ Docker build failed for service: $service"
+            echo "Common issues:"
+            echo "1. Check Dockerfile syntax"
+            echo "2. Verify base image availability"
+            echo "3. Check build context and dependencies"
+            echo "4. Review build logs above for specific errors"
+            exit 1
+          fi
+
+          # Move cache to avoid ever-growing cache
+          rm -rf /tmp/.buildx-cache
+          mv /tmp/.buildx-cache-new /tmp/.buildx-cache || true
+
+          echo "Docker image built successfully: $image_uri"
+          echo "build-success=true" >> $GITHUB_OUTPUT
+
+      - name: Push image to ECR with retry
+        id: push
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_on: error
+          command: |
+            image_uri="${{ steps.vars.outputs.image-uri }}"
+            ecr_repo="${{ steps.vars.outputs.ecr-repo }}"
+
+            echo "Pushing Docker image to ECR: $image_uri"
+
+            # Push both tags (commit SHA and latest)
+            docker push "$image_uri"
+            docker push "${{ env.ECR_REGISTRY }}/$ecr_repo:latest"
+
+            echo "✅ Image pushed successfully to ECR"
+
+      - name: Verify ECR push
+        id: verify-push
+        run: |
+          image_uri="${{ steps.vars.outputs.image-uri }}"
+          ecr_repo="${{ steps.vars.outputs.ecr-repo }}"
+          short_sha="${{ steps.vars.outputs.short-sha }}"
+
+          echo "Verifying image push to ECR..."
+
+          # Verify the image exists in ECR
+          if aws ecr describe-images \
+            --repository-name "$ecr_repo" \
+            --image-ids imageTag="$short_sha" \
+            --region "${{ env.AWS_REGION }}" > /dev/null 2>&1; then
+            
+            echo "✅ Image verification successful"
+            
+            # Get image details
+            image_details=$(aws ecr describe-images \
+              --repository-name "$ecr_repo" \
+              --image-ids imageTag="$short_sha" \
+              --region "${{ env.AWS_REGION }}" \
+              --query 'imageDetails[0]')
+            
+            image_size=$(echo "$image_details" | jq -r '.imageSizeInBytes')
+            push_date=$(echo "$image_details" | jq -r '.imagePushedAt')
+            
+            echo "Image size: $(numfmt --to=iec $image_size)"
+            echo "Push date: $push_date"
+            
+            # Output for downstream jobs
+            echo "push-success=true" >> $GITHUB_OUTPUT
+            echo "image-uri=$image_uri" >> $GITHUB_OUTPUT
+            
+          else
+            echo "❌ Image verification failed - image not found in ECR"
+            exit 1
+          fi
+
+      - name: Validate Docker image
+        run: |
+          image_uri="${{ steps.vars.outputs.image-uri }}"
+
+          echo "Validating Docker image: $image_uri"
+
+          # Check if image exists
+          if docker image inspect "$image_uri" > /dev/null 2>&1; then
+            echo "✅ Image validation successful"
+            
+            # Get image size
+            image_size=$(docker image inspect "$image_uri" --format='{{.Size}}' | numfmt --to=iec)
+            echo "Image size: $image_size"
+            
+            # Get image layers count
+            layers_count=$(docker image inspect "$image_uri" --format='{{len .RootFS.Layers}}')
+            echo "Number of layers: $layers_count"
+          else
+            echo "❌ Image validation failed"
+            exit 1
+          fi
+
+      - name: Output image URI for Helm update
+        id: output-uri
+        run: |
+          service="${{ steps.vars.outputs.service }}"
+          image_uri="${{ steps.vars.outputs.image-uri }}"
+
+          echo "Service: $service"
+          echo "Image URI: $image_uri"
+
+          # Create output for the Helm update job
+          echo "$service=$image_uri" >> $GITHUB_OUTPUT
+
+      - name: Security scan integration
+        id: security-scan
+        run: |
+          ecr_repo="${{ steps.vars.outputs.ecr-repo }}"
+          short_sha="${{ steps.vars.outputs.short-sha }}"
+
+          echo "Initiating security scan for image..."
+
+          # ECR automatically scans on push, but we can check scan results
+          echo "Waiting for ECR vulnerability scan to complete..."
+          sleep 30  # Give ECR time to initiate scan
+
+          # Check if scan results are available
+          scan_status=$(aws ecr describe-image-scan-findings \
+            --repository-name "$ecr_repo" \
+            --image-id imageTag="$short_sha" \
+            --region "${{ env.AWS_REGION }}" \
+            --query 'imageScanStatus.status' \
+            --output text 2>/dev/null || echo "IN_PROGRESS")
+
+          echo "Scan status: $scan_status"
+
+          if [[ "$scan_status" == "COMPLETE" ]]; then
+            # Get scan results
+            findings=$(aws ecr describe-image-scan-findings \
+              --repository-name "$ecr_repo" \
+              --image-id imageTag="$short_sha" \
+              --region "${{ env.AWS_REGION }}" \
+              --query 'imageScanFindings.findingCounts')
+            
+            echo "Security scan results: $findings"
+            
+            # Check for critical vulnerabilities
+            critical_count=$(echo "$findings" | jq -r '.CRITICAL // 0')
+            high_count=$(echo "$findings" | jq -r '.HIGH // 0')
+            
+            echo "Critical vulnerabilities: $critical_count"
+            echo "High vulnerabilities: $high_count"
+            
+            # For now, just log the results (can be made stricter in production)
+            if [[ "$critical_count" -gt 0 ]]; then
+              echo "⚠️ Warning: $critical_count critical vulnerabilities found"
+            fi
+            
+            echo "scan-complete=true" >> $GITHUB_OUTPUT
+          else
+            echo "ℹ️ Security scan in progress or not yet started"
+            echo "scan-complete=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Cleanup build artifacts
+        if: always()
+        run: |
+          echo "Cleaning up build artifacts..."
+
+          # Remove temporary files
+          rm -rf /tmp/image_uris.json /tmp/updated_files.txt || true
+
+          # Clean up Docker system (keep cache)
+          docker system prune -f --volumes || true
+
+          # Clean up old cache if it exists
+          rm -rf /tmp/.buildx-cache-old || true
+
+          echo "✅ Cleanup completed"
+
+  update-helm-charts:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-services]
+    if: needs.detect-changes.outputs.has-changes == 'true' && success()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Install yq
+        run: |
+          sudo wget -qO /usr/local/bin/yq https://github.com/mikefarah/yq/releases/latest/download/yq_linux_amd64
+          sudo chmod +x /usr/local/bin/yq
+          yq --version
+
+      - name: Collect image URIs from build jobs
+        id: collect-uris
+        run: |
+          services_json='${{ needs.detect-changes.outputs.services }}'
+          services=($(echo "$services_json" | jq -r '.[]'))
+
+          echo "Collecting image URIs for services: ${services[*]}"
+
+          # Create a temporary file to store image URIs
+          echo "{}" > /tmp/image_uris.json
+
+          for service in "${services[@]}"; do
+            # Get the image URI from build job outputs
+            # Note: This is a simplified approach - in practice, we'd need to collect from matrix job outputs
+            short_sha="${{ github.sha }}"
+            short_sha=${short_sha:0:7}
+            image_uri="${{ env.ECR_REGISTRY }}/retail-store-$service:$short_sha"
+            
+            echo "Service: $service, Image URI: $image_uri"
+            
+            # Store in JSON format
+            jq --arg service "$service" --arg uri "$image_uri" '. + {($service): $uri}' /tmp/image_uris.json > /tmp/temp.json
+            mv /tmp/temp.json /tmp/image_uris.json
+          done
+
+          echo "Image URIs collected:"
+          cat /tmp/image_uris.json
+
+          echo "uris=$(cat /tmp/image_uris.json)" >> $GITHUB_OUTPUT
+
+      - name: Update Helm chart values
+        id: update-values
+        run: |
+          set -euo pipefail
+
+          services_json='${{ needs.detect-changes.outputs.services }}'
+
+          # Validate services JSON
+          if ! echo "$services_json" | jq empty 2>/dev/null; then
+            echo "❌ Error: Invalid services JSON: $services_json"
+            exit 1
+          fi
+
+          services=($(echo "$services_json" | jq -r '.[]'))
+
+          echo "Updating Helm chart values for services: ${services[*]}"
+
+          updated_files=()
+
+          for service in "${services[@]}"; do
+            values_file="src/$service/chart/values.yaml"
+            
+            if [[ ! -f "$values_file" ]]; then
+              echo "⚠️ Values file not found: $values_file"
+              continue
+            fi
+            
+            echo "Updating values file: $values_file"
+            
+            # Backup original file
+            cp "$values_file" "$values_file.backup"
+            
+            # Get new image details
+            short_sha="${{ github.sha }}"
+            short_sha=${short_sha:0:7}
+            new_repository="${{ env.ECR_REGISTRY }}/retail-store-$service"
+            new_tag="$short_sha"
+            
+            echo "New repository: $new_repository"
+            echo "New tag: $new_tag"
+            
+            # Update only the main service image (preserve infrastructure images)
+            # Use yq to update the first image section only
+            if ! yq eval '.image.repository = "'"$new_repository"'"' -i "$values_file"; then
+              echo "❌ Error: Failed to update repository in $values_file"
+              mv "$values_file.backup" "$values_file"
+              exit 1
+            fi
+            
+            if ! yq eval '.image.tag = "'"$new_tag"'"' -i "$values_file"; then
+              echo "❌ Error: Failed to update tag in $values_file"
+              mv "$values_file.backup" "$values_file"
+              exit 1
+            fi
+            
+            # Validate YAML syntax
+            if yq eval '.' "$values_file" > /dev/null 2>&1; then
+              echo "✅ YAML validation successful for $values_file"
+              updated_files+=("$values_file")
+              
+              # Show the changes
+              echo "Changes made to $values_file:"
+              diff "$values_file.backup" "$values_file" || true
+              
+              # Clean up backup
+              rm "$values_file.backup"
+            else
+              echo "❌ YAML validation failed for $values_file"
+              # Restore backup
+              mv "$values_file.backup" "$values_file"
+              exit 1
+            fi
+          done
+
+          # Output updated files for git commit
+          if [ ${#updated_files[@]} -gt 0 ]; then
+            echo "files-updated=true" >> $GITHUB_OUTPUT
+            printf '%s\n' "${updated_files[@]}" > /tmp/updated_files.txt
+            echo "Updated files:"
+            cat /tmp/updated_files.txt
+          else
+            echo "files-updated=false" >> $GITHUB_OUTPUT
+            echo "No files were updated"
+          fi
+
+      - name: Commit and push changes
+        id: commit-push
+        if: steps.update-values.outputs.files-updated == 'true'
+        uses: nick-invision/retry@v2
+        with:
+          timeout_minutes: 5
+          max_attempts: 2
+          retry_on: error
+          command: |
+            # Pull latest changes to avoid conflicts
+            git pull origin gitops --rebase
+
+            # Add updated files
+            while IFS= read -r file; do
+              git add "$file"
+              echo "Added file: $file"
+            done < /tmp/updated_files.txt
+
+            # Create descriptive commit message
+            services_json='${{ needs.detect-changes.outputs.services }}'
+            services=($(echo "$services_json" | jq -r '.[]'))
+            short_sha="${{ github.sha }}"
+            short_sha=${short_sha:0:7}
+
+            if [ ${#services[@]} -eq 1 ]; then
+              commit_msg="🚀 Update ${services[0]} image to $short_sha
+
+            - Updated Helm chart values for ${services[0]}
+            - New image: ${{ env.ECR_REGISTRY }}/retail-store-${services[0]}:$short_sha
+            - Commit: ${{ github.sha }}
+
+            [skip ci]"
+            else
+              services_list=$(IFS=', '; echo "${services[*]}")
+              commit_msg="🚀 Update multiple services to $short_sha
+
+            Services updated: $services_list
+            - Updated Helm chart values for ${#services[@]} services
+            - New images tagged with: $short_sha
+            - Commit: ${{ github.sha }}
+
+            [skip ci]"
+            fi
+
+            # Commit changes
+            git commit -m "$commit_msg"
+
+            # Push changes
+            git push origin gitops
+
+            echo "✅ Changes committed and pushed successfully"
+
+      - name: Verify git push
+        id: verify-git
+        if: steps.update-values.outputs.files-updated == 'true'
+        run: |
+          echo "Verifying git push..."
+
+          # Get the latest commit SHA
+          latest_commit=$(git rev-parse HEAD)
+          echo "Latest commit: $latest_commit"
+
+          # Verify the commit exists on remote
+          if git ls-remote --exit-code origin gitops | grep -q "$latest_commit"; then
+            echo "✅ Git push verification successful"
+            echo "push-success=true" >> $GITHUB_OUTPUT
+          else
+            echo "❌ Git push verification failed"
+            echo "push-success=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+
+  workflow-summary:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, build-services, update-helm-charts]
+    if: always()
+    outputs:
+      workflow-status: ${{ steps.summary.outputs.status }}
+      services-processed: ${{ steps.summary.outputs.services }}
+      images-built: ${{ steps.summary.outputs.images }}
+    steps:
+      - name: Generate workflow summary
+        id: summary
+        run: |
+          set -euo pipefail
+
+          echo "# 🚀 CI/CD Pipeline Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Get workflow status
+          detect_status="${{ needs.detect-changes.result }}"
+          build_status="${{ needs.build-services.result }}"
+          helm_status="${{ needs.update-helm-charts.result }}"
+
+          # Determine overall status
+          if [[ "$detect_status" == "success" && "$build_status" == "success" && "$helm_status" == "success" ]]; then
+            overall_status="✅ SUCCESS"
+            status_emoji="✅"
+          elif [[ "$detect_status" == "success" && "$build_status" == "success" && "$helm_status" == "skipped" ]]; then
+            overall_status="⚠️ PARTIAL SUCCESS (Helm update skipped)"
+            status_emoji="⚠️"
+          elif [[ "$detect_status" == "success" && "${{ needs.detect-changes.outputs.has-changes }}" == "false" ]]; then
+            overall_status="ℹ️ NO CHANGES DETECTED"
+            status_emoji="ℹ️"
+          else
+            overall_status="❌ FAILED"
+            status_emoji="❌"
+          fi
+
+          echo "## $overall_status" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Job status table
+          echo "| Job | Status | Duration |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----|--------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Change Detection | $([[ "$detect_status" == "success" ]] && echo "✅ Success" || echo "❌ Failed") | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| Build Services | $([[ "$build_status" == "success" ]] && echo "✅ Success" || [[ "$build_status" == "skipped" ]] && echo "⏭️ Skipped" || echo "❌ Failed") | - |" >> $GITHUB_STEP_SUMMARY
+          echo "| Update Helm Charts | $([[ "$helm_status" == "success" ]] && echo "✅ Success" || [[ "$helm_status" == "skipped" ]] && echo "⏭️ Skipped" || echo "❌ Failed") | - |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Services processed
+          services_json='${{ needs.detect-changes.outputs.services }}'
+          if [[ "$services_json" != "[]" && "$services_json" != "" ]]; then
+            services=($(echo "$services_json" | jq -r '.[]'))
+            echo "## 📦 Services Processed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            for service in "${services[@]}"; do
+              short_sha="${{ github.sha }}"
+              short_sha=${short_sha:0:7}
+              image_uri="${{ env.ECR_REGISTRY }}/retail-store-$service:$short_sha"
+              
+              echo "- **$service**: \`$image_uri\`" >> $GITHUB_STEP_SUMMARY
+            done
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            # Set outputs
+            echo "services=${services[*]}" >> $GITHUB_OUTPUT
+            echo "images=$(printf '%s\n' "${services[@]}" | sed "s/^/retail-store-/" | sed "s/$/:$short_sha/" | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          else
+            echo "## ℹ️ No Services Processed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "No changes detected in service directories." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            
+            echo "services=none" >> $GITHUB_OUTPUT
+            echo "images=none" >> $GITHUB_OUTPUT
+          fi
+
+          # Workflow details
+          echo "## 📋 Workflow Details" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Trigger**: ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch**: ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Actor**: @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow**: [${{ github.workflow }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Next steps
+          if [[ "$overall_status" == *"SUCCESS"* ]]; then
+            echo "## 🎯 Next Steps" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. ArgoCD will automatically detect the Helm chart changes" >> $GITHUB_STEP_SUMMARY
+            echo "2. Applications will be synced and deployed to the cluster" >> $GITHUB_STEP_SUMMARY
+            echo "3. Monitor the ArgoCD UI for deployment status" >> $GITHUB_STEP_SUMMARY
+          elif [[ "$overall_status" == *"FAILED"* ]]; then
+            echo "## 🔧 Troubleshooting" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "1. Check the failed job logs above" >> $GITHUB_STEP_SUMMARY
+            echo "2. Verify AWS credentials and permissions" >> $GITHUB_STEP_SUMMARY
+            echo "3. Ensure ECR repositories are accessible" >> $GITHUB_STEP_SUMMARY
+            echo "4. Check Dockerfile syntax and build context" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "status=$overall_status" >> $GITHUB_OUTPUT
+
+          # Console output
+          echo "==================================="
+          echo "CI/CD Pipeline Summary"
+          echo "==================================="
+          echo "Overall Status: $overall_status"
+          echo "Services: ${services[*]:-none}"
+          echo "Trigger: ${{ github.event_name }}"
+          echo "Commit: ${{ github.sha }}"
+          echo "==================================="
