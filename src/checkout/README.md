@@ -1,5 +1,5 @@
 # AWS Containers Retail Sample - Checkout Service
-# Test Commit
+# Test Commit 2
 
 <!-- GitOps Test: Testing improved change detection workflow -->
 

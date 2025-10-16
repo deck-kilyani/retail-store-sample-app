@@ -1,5 +1,5 @@
 # AWS Containers Retail Sample - UI Service
-# Test Commit
+# Test Commit 2
 
 <!-- GitOps Test: Testing deploy-simple.yml workflow -->
 

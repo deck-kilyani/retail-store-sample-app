@@ -1,5 +1,5 @@
 # AWS Containers Retail Sample - Catalog Service
-# Test Commit
+# Test Commit 2
 
 <!-- GitOps Test: Final workflow validation -->
 
